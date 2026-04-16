@@ -1,22 +1,66 @@
 import SwiftUI
 import PhotosUI
-import AVFoundation
 import ImageIO
+import UniformTypeIdentifiers
 
 @Observable
 class variablesManager {
     var selectedItems: [PhotosPickerItem] = []
     var image: [Image] = []
     var selectedIndices: Set<Int> = []
+    var navigationPath = NavigationPath()
+    var isProcessing = false
     var isLoselessOn = true
     var isOriginalPhotosOn = true
     var isMetadataOn = true
     var quality = 1.0
-    var navigationPath = NavigationPath()
-    var isProcessing = false
     var totalSavedBytes: Int64 = 0
     var formattedSavings: String {
         ByteCountFormatter.string(fromByteCount: totalSavedBytes, countStyle: .file)
+    }
+    func resourceSize(for asset: PHAsset) async -> Int64 {
+        await withCheckedContinuation { continuation in
+            let resources = PHAssetResource.assetResources(for: asset)
+            if resources.isEmpty {
+                continuation.resume(returning: 0)
+                return
+            }
+            let manager = PHAssetResourceManager.default()
+            var total: Int64 = 0
+            var remaining = resources.count
+            for res in resources {
+                var bytes: Int64 = 0
+                let options = PHAssetResourceRequestOptions()
+                options.isNetworkAccessAllowed = true
+                manager.requestData(for: res, options: options) { data in
+                    bytes += Int64(data.count)
+                } completionHandler: { _ in
+                    total += bytes
+                    remaining -= 1
+                    if remaining == 0 {
+                        continuation.resume(returning: total)
+                    }
+                }
+            }
+        }
+    }
+    func saveToPhotosReturningIdentifier(data: Data, originalDate: Date?) async -> String? {
+        await withCheckedContinuation { continuation in
+            guard let image = UIImage(data: data) else {
+                continuation.resume(returning: nil)
+                return
+            }
+            var placeholder: PHObjectPlaceholder?
+            PHPhotoLibrary.shared().performChanges({
+                let request = PHAssetChangeRequest.creationRequestForAsset(from: image)
+                if let date = originalDate {
+                    request.creationDate = date
+                }
+                placeholder = request.placeholderForCreatedAsset
+            }, completionHandler: { success, _ in
+                continuation.resume(returning: success ? placeholder?.localIdentifier : nil)
+            })
+        }
     }
     func processImages() async {
         await MainActor.run {
@@ -32,77 +76,84 @@ class variablesManager {
         for (index, item) in selectedItems.enumerated() {
             guard selectedIndices.contains(index) else { continue }
             var captureDate: Date? = nil
-                if let identifier = item.itemIdentifier {
-                    let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-                    captureDate = result.firstObject?.creationDate
+            var originalAsset: PHAsset?
+            if let identifier = item.itemIdentifier {
+                let assetResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+                if let asset = assetResult.firstObject {
+                    originalAsset = asset
+                    captureDate = asset.creationDate
+                    if !isOriginalPhotosOn { assetsToDelete.append(asset) }
                 }
-            guard let originalData = try? await item.loadTransferable(type: Data.self) else { continue }
-            let originalSize = Int64(originalData.count)
+            }
+            guard let asset = originalAsset else { continue }
+            let originalBytes = await resourceSize(for: asset)
+            guard let rawData = try? await item.loadTransferable(type: Data.self),
+                  let uiImage = UIImage(data: rawData) else { continue }
             var originalMetadata: [AnyHashable: Any]? = nil
-            if let source = CGImageSourceCreateWithData(originalData as CFData, nil) {
+            if let source = CGImageSourceCreateWithData(rawData as CFData, nil) {
                 originalMetadata = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [AnyHashable: Any]
             }
-            guard let uiImage = UIImage(data: originalData) else { continue }
-            let finalData = getHEICData(
-                for: uiImage,
-                metadata: isMetadataOn ? originalMetadata : nil,
-                quality: isLoselessOn ? 1.0 : quality
-            )
-            if let dataToSave = finalData {
-                saveToPhotos(data: dataToSave, originalDate: captureDate)
-                let compressedSize = Int64(dataToSave.count)
-                let savings = originalSize - compressedSize
-                await MainActor.run { self.totalSavedBytes += savings }
-                if !isOriginalPhotosOn, let identifier = item.itemIdentifier {
-                    let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-                    if let asset = result.firstObject {
-                        assetsToDelete.append(asset)
-                    }
-                }
+            let compressionQuality = isLoselessOn ? 1.0 : quality
+            guard let finalData = getHEICData(for: uiImage, metadata: originalMetadata, quality: compressionQuality) else { continue }
+            guard let newIdentifier = await saveToPhotosReturningIdentifier(data: finalData, originalDate: captureDate) else { continue }
+            var newAssetBytes: Int64 = 0
+            let newFetch = PHAsset.fetchAssets(withLocalIdentifiers: [newIdentifier], options: nil)
+            if let newAsset = newFetch.firstObject {
+                newAssetBytes = await resourceSize(for: newAsset)
+            }
+            let encodingSavings = max(0, originalBytes - newAssetBytes)
+            await MainActor.run {
+                self.totalSavedBytes += encodingSavings
+            }
+        }
+        if !isOriginalPhotosOn && !assetsToDelete.isEmpty {
+            await withCheckedContinuation { continuation in
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetChangeRequest.deleteAssets(assetsToDelete as NSArray)
+                }, completionHandler: { _, _ in
+                    continuation.resume()
+                })
             }
         }
         await MainActor.run {
             self.isProcessing = false
             self.navigationPath.append("CompleteView")
         }
-        if !isOriginalPhotosOn && !assetsToDelete.isEmpty {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                self.deleteOriginals(assets: assetsToDelete)
-            }
-        }
-    }
-    func saveToPhotos(data: Data, originalDate: Date?) {
-        guard let image = UIImage(data: data) else { return }
-        PHPhotoLibrary.shared().performChanges {
-            let request = PHAssetChangeRequest.creationRequestForAsset(from: image)
-            if let date = originalDate {
-                request.creationDate = date
-            }
-        }
-    }
-    func deleteOriginals(assets: [PHAsset]) {
-        PHPhotoLibrary.shared().performChanges {
-            PHAssetChangeRequest.deleteAssets(assets as NSArray)
-        }
     }
     func getHEICData(for image: UIImage, metadata: [AnyHashable: Any]?, quality: Double) -> Data? {
         let data = NSMutableData()
         guard let cgImage = image.cgImage,
-              let destination = CGImageDestinationCreateWithData(data, "public.heic" as CFString, 1, nil) else {
+              let destination = CGImageDestinationCreateWithData(data, UTType.heic.identifier as CFString, 1, nil) else {
             return nil
         }
         var properties: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: quality
         ]
-        if let metadata = metadata {
+        if isMetadataOn, let metadata = metadata {
             for (key, value) in metadata {
                 if let keyString = key as? String {
                     properties[keyString as CFString] = value
                 }
             }
+        } else {
+            properties[kCGImagePropertyExifDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyIPTCDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyTIFFDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyGPSDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyJFIFDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyPNGDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyRawDictionary] = [:] as CFDictionary
+            properties[kCGImagePropertyMakerAppleDictionary] = [:] as CFDictionary
+            properties[kCGImageDestinationEmbedThumbnail] = false
+            properties[kCGImageDestinationMetadata] = kCFNull
         }
         CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
         return CGImageDestinationFinalize(destination) ? (data as Data) : nil
+    }
+    func deleteOriginals(assets: [PHAsset]) {
+        PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets(assets as NSArray)
+        }
     }
 }
 
@@ -112,7 +163,7 @@ struct ContentView: View {
         NavigationStack(path: $variables.navigationPath) {
             VStack {
                 NavigationLink(value: "SelectView") {
-                    Text("Select Photos")
+                    Text("Compress Photos")
                         .fontWeight(.semibold)
                         .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
@@ -123,7 +174,7 @@ struct ContentView: View {
                 }
                 Spacer()
             }
-            .navigationTitle("Photo Compress")
+            .navigationTitle("Geschenk")
             .padding()
             .navigationDestination(for: String.self) { value in
                 switch value {
